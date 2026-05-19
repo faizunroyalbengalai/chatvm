@@ -43,42 +43,6 @@
         name: pm2
         global: yes
 
-    # ── Local database installation ───────────────────────────────────────────
-    - name: Install PostgreSQL server
-      apt:
-        name:
-          - postgresql
-          - postgresql-contrib
-        state: present
-        update_cache: yes
-
-    - name: Ensure PostgreSQL is started
-      systemd:
-        name: postgresql
-        state: started
-        enabled: yes
-
-    - name: Wait for PostgreSQL to be ready
-      wait_for:
-        port: 5432
-        host: 127.0.0.1
-        timeout: 60
-
-    - name: Create PostgreSQL database and user
-      shell: |
-        DB_NAME="{{ deploy_db_name | default(project | replace('-', '_') + 'db', true) }}"
-        DB_USER="{{ deploy_db_username | default('appuser', true) }}"
-        DB_PASS="{{ deploy_db_password | default('apppass', true) }}"
-        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1 \
-          || sudo -u postgres psql -c "CREATE DATABASE \"$DB_NAME\";"
-        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1 \
-          || sudo -u postgres psql -c "CREATE USER \"$DB_USER\" WITH PASSWORD '$DB_PASS';"
-        sudo -u postgres psql -c "ALTER USER \"$DB_USER\" WITH PASSWORD '$DB_PASS';"
-        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$DB_USER\";"
-        sudo -u postgres psql -c "ALTER DATABASE \"$DB_NAME\" OWNER TO \"$DB_USER\";"
-      args:
-        executable: /bin/bash
-
 
     - name: Install Nginx
       apt:

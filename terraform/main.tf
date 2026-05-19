@@ -39,6 +39,19 @@ variable "admin_username" {
   type    = string
   default = "ubuntu"
 }
+variable "db_name" {
+  type    = string
+  default = ""
+}
+variable "db_username" {
+  type    = string
+  default = ""
+}
+variable "db_password" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
 
 resource "azurerm_resource_group" "rg" {
   name     = "${var.project_name}-rg"
@@ -65,8 +78,35 @@ resource "azurerm_subnet" "subnet" {
   resource_group_name  = azurerm_resource_group.rg.name
   virtual_network_name = azurerm_virtual_network.vnet.name
   address_prefixes     = ["10.20.1.0/24"]
+  service_endpoints    = ["Microsoft.Storage"]
 }
 
+resource "azurerm_subnet" "db_subnet" {
+  name                 = "${var.project_name}-db-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.20.2.0/24"]
+  service_endpoints    = ["Microsoft.Storage"]
+  delegation {
+    name = "fs-delegation"
+    service_delegation {
+      name    = "Microsoft.DBforPostgreSQL/flexibleServers"
+      actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+    }
+  }
+}
+
+resource "azurerm_private_dns_zone" "db" {
+  name                = "${var.project_name}.postgres.database.azure.com"
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "db" {
+  name                  = "${var.project_name}-db-dnslink"
+  resource_group_name   = azurerm_resource_group.rg.name
+  private_dns_zone_name = azurerm_private_dns_zone.db.name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+}
 
 resource "azurerm_public_ip" "pip" {
   name                = "${var.project_name}-pip"
@@ -191,6 +231,61 @@ resource "azurerm_linux_virtual_machine" "vm" {
     ManagedBy = "udap"
   }
 }
+locals {
+  effective_db_region = var.azure_db_region != "" ? var.azure_db_region : var.azure_region
+  db_is_cross_region  = var.azure_db_region != "" && var.azure_db_region != var.azure_region
+}
+
+resource "azurerm_resource_group" "db_rg" {
+  count    = local.db_is_cross_region ? 1 : 0
+  name     = "${var.project_name}-db-rg"
+  location = var.azure_db_region
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
+locals {
+  db_resource_group_name = local.db_is_cross_region ? azurerm_resource_group.db_rg[0].name : azurerm_resource_group.rg.name
+}
+
+resource "azurerm_postgresql_flexible_server" "db" {
+  name                          = "${var.project_name}-db"
+  resource_group_name           = local.db_resource_group_name
+  location                      = local.effective_db_region
+  version                       = "15"
+  # Same-region: use delegated VNet subnet for private connectivity.
+  # Cross-region: VNet integration impossible, fall back to public + firewall.
+  delegated_subnet_id           = local.db_is_cross_region ? null : azurerm_subnet.db_subnet.id
+  private_dns_zone_id           = local.db_is_cross_region ? null : azurerm_private_dns_zone.db.id
+  administrator_login           = var.db_username != "" ? var.db_username : "appuser"
+  administrator_password        = var.db_password
+  zone                          = "1"
+  storage_mb                    = 32768
+  sku_name                      = "B_Standard_B1ms"
+  public_network_access_enabled = local.db_is_cross_region
+  depends_on                    = [azurerm_private_dns_zone_virtual_network_link.db]
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
+resource "azurerm_postgresql_flexible_server_firewall_rule" "allow_vm" {
+  count            = local.db_is_cross_region ? 1 : 0
+  name             = "allow-vm-public-ip"
+  server_id        = azurerm_postgresql_flexible_server.db.id
+  start_ip_address = azurerm_public_ip.pip.ip_address
+  end_ip_address   = azurerm_public_ip.pip.ip_address
+}
+
+resource "azurerm_postgresql_flexible_server_database" "appdb" {
+  name      = var.db_name != "" ? var.db_name : "${replace(var.project_name, "-", "_")}db"
+  server_id = azurerm_postgresql_flexible_server.db.id
+  collation = "en_US.utf8"
+  charset   = "utf8"
+}
 
 output "public_ip" {
   value = azurerm_public_ip.pip.ip_address
@@ -200,4 +295,10 @@ output "vm_id" {
 }
 output "resource_group_name" {
   value = azurerm_resource_group.rg.name
+}
+output "db_endpoint" {
+  value = azurerm_postgresql_flexible_server.db.fqdn
+}
+output "db_port" {
+  value = 5432
 }

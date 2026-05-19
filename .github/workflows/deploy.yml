@@ -49,11 +49,21 @@ jobs:
             -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
       - name: Terraform plan
         working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
+          EXTRA_ARGS=()
+          [ -n "$DB_NAME" ]     && EXTRA_ARGS+=(-var "db_name=$DB_NAME")
+          [ -n "$DB_USERNAME" ] && EXTRA_ARGS+=(-var "db_username=$DB_USERNAME")
+          [ -n "$DB_PASSWORD" ] && EXTRA_ARGS+=(-var "db_password=$DB_PASSWORD")
           terraform plan \
             -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="azure_region=${{ secrets.AZURE_REGION }}" \
+            -var="azure_db_region=${{ secrets.AZURE_DB_REGION }}" \
+            "${EXTRA_ARGS[@]}" \
             -out=tfplan
       - name: Terraform apply
         working-directory: terraform
@@ -93,20 +103,65 @@ jobs:
               "cloud-init status --wait 2>/dev/null; echo ok" \
               && break || sleep 15
           done
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init (read state for DB endpoint)
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
+      - name: Resolve Azure DB endpoint
+        id: db
+        working-directory: terraform
+        env:
+          DEFAULT_PORT: "5432"
+        run: |
+          # Pull the FQDN out of terraform state. Unlike AWS RDS endpoints, Azure
+          # Flexible Server FQDNs don't embed the project name in a way that
+          # collides with secret-scrubbing — but we still keep the resolution in
+          # the same job as Ansible to mirror the AWS pattern (no cross-job
+          # output passing of values that could match secret substrings).
+          ENDPOINT=$(terraform output -raw db_endpoint 2>/dev/null || echo "")
+          PORT=$(terraform output -raw db_port 2>/dev/null || echo "$DEFAULT_PORT")
+          PORT="${PORT:-$DEFAULT_PORT}"
+          if [ -z "$ENDPOINT" ]; then
+            echo "::error title=Azure DB endpoint missing::Could not read db_endpoint from terraform state. Make sure terraform apply created the flexible server."
+            exit 1
+          fi
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "port=$PORT"         >> $GITHUB_OUTPUT
+          echo "Resolved Azure DB endpoint OK (port=$PORT)"
       - name: Run Ansible playbook
         working-directory: ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
-          DEPLOY_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DEPLOY_DB_ENDPOINT:  ${{ steps.db.outputs.endpoint }}
+          DEPLOY_DB_PORT:      ${{ steps.db.outputs.port }}
           DEPLOY_DB_NAME:      ${{ secrets.DB_NAME }}
           DEPLOY_DB_USERNAME:  ${{ secrets.DB_USERNAME }}
           DEPLOY_DB_PASSWORD:  ${{ secrets.DB_PASSWORD }}
           DEPLOY_DB_TYPE:      ${{ secrets.DB_TYPE }}
+          DEPLOY_PROJECT:      ${{ secrets.PROJECT_NAME }}
         run: |
           # Pass DB connection details to Ansible as --extra-vars so the
           # playbook does not rely on `lookup('env', ...)`. Quoting matters:
           # the password may contain shell metacharacters.
           EXTRA_VARS=()
+          : "${DEPLOY_DB_USERNAME:=appuser}"
+          if [ -z "$DEPLOY_DB_NAME" ]; then
+            DEPLOY_DB_NAME="$(printf '%s' "$DEPLOY_PROJECT" | tr '-' '_')db"
+          fi
+          if [ -z "$DEPLOY_DB_ENDPOINT" ]; then
+            echo "::error title=Azure DB endpoint missing::Resolve step did not produce an endpoint. Aborting before we deploy a localhost-bound app."
+            exit 1
+          fi
+          # Azure Postgres Flexible Server requires the role suffix in the
+          # username for managed-identity-less SQL auth: "user@server-name".
+          # When using password auth on Flex Server, the plain username works,
+          # so we keep it untouched here. Spring's JDBC driver gets the bare URL.
+          DEPLOY_DATABASE_URL="postgresql://${DEPLOY_DB_USERNAME}:${DEPLOY_DB_PASSWORD}@${DEPLOY_DB_ENDPOINT}:${DEPLOY_DB_PORT}/${DEPLOY_DB_NAME}?sslmode=require"
           EXTRA_VARS+=(-e "deploy_database_url=${DEPLOY_DATABASE_URL}")
           EXTRA_VARS+=(-e "deploy_db_name=${DEPLOY_DB_NAME}")
           EXTRA_VARS+=(-e "deploy_db_username=${DEPLOY_DB_USERNAME}")
