@@ -1,0 +1,50 @@
+name: Destroy — chatvm
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+jobs:
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
+      - name: Terraform destroy
+        working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          # DB variables must be passed even during destroy — Terraform
+          # validates the resource config (including non-empty password) before
+          # planning the deletion. Use stored secrets when set, placeholders
+          # otherwise so the workflow stays runnable without them.
+          EXTRA_ARGS=()
+          EXTRA_ARGS+=(-var "db_name=${DB_NAME:-destroy}")
+          EXTRA_ARGS+=(-var "db_username=${DB_USERNAME:-destroy}")
+          EXTRA_ARGS+=(-var "db_password=${DB_PASSWORD:-destroy-placeholder-pw}")
+          terraform destroy -auto-approve \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="azure_region=${{ secrets.AZURE_REGION }}" \
+            -var="azure_db_region=${{ secrets.AZURE_DB_REGION }}" \
+            "${EXTRA_ARGS[@]}"

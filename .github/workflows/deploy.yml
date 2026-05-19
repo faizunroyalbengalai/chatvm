@@ -1,0 +1,135 @@
+name: Deploy — chatvm
+
+on:
+  workflow_dispatch:
+
+# Force all actions to run on Node.js 24 to avoid Node 20 deprecation warnings
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm test --if-present
+
+  provision:
+    name: Provision Azure VM (Terraform)
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.ip }}
+      resource_group: ${{ steps.get_ip.outputs.rg }}
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
+      - name: Terraform plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="azure_region=${{ secrets.AZURE_REGION }}" \
+            -out=tfplan
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+      - name: Get server IP and resource group
+        id: get_ip
+        working-directory: terraform
+        run: |
+          IP=$(terraform output -raw public_ip)
+          RG=$(terraform output -raw resource_group_name)
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+          echo "rg=$RG" >> $GITHUB_OUTPUT
+
+
+  configure:
+    name: Configure & Deploy (Ansible)
+    runs-on: ubuntu-latest
+    needs: provision
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+      - name: Install Ansible
+        run: sudo apt-get update -qq && sudo apt-get install -y ansible
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 40); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              -i /tmp/deploy_key ${{ secrets.SSH_USER }}@${{ needs.provision.outputs.server_ip }} \
+              "cloud-init status --wait 2>/dev/null; echo ok" \
+              && break || sleep 15
+          done
+      - name: Run Ansible playbook
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          DEPLOY_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DEPLOY_DB_NAME:      ${{ secrets.DB_NAME }}
+          DEPLOY_DB_USERNAME:  ${{ secrets.DB_USERNAME }}
+          DEPLOY_DB_PASSWORD:  ${{ secrets.DB_PASSWORD }}
+          DEPLOY_DB_TYPE:      ${{ secrets.DB_TYPE }}
+        run: |
+          # Pass DB connection details to Ansible as --extra-vars so the
+          # playbook does not rely on `lookup('env', ...)`. Quoting matters:
+          # the password may contain shell metacharacters.
+          EXTRA_VARS=()
+          EXTRA_VARS+=(-e "deploy_database_url=${DEPLOY_DATABASE_URL}")
+          EXTRA_VARS+=(-e "deploy_db_name=${DEPLOY_DB_NAME}")
+          EXTRA_VARS+=(-e "deploy_db_username=${DEPLOY_DB_USERNAME}")
+          EXTRA_VARS+=(-e "deploy_db_password=${DEPLOY_DB_PASSWORD}")
+          EXTRA_VARS+=(-e "deploy_db_type=${DEPLOY_DB_TYPE}")
+          ansible-playbook \
+            -i "${{ needs.provision.outputs.server_ip }}," \
+            --private-key /tmp/deploy_key \
+            -u ${{ secrets.SSH_USER }} \
+            --timeout 60 \
+            "${EXTRA_VARS[@]}" \
+            playbook.yml
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Wait for app to be healthy
+        run: |
+          for i in $(seq 1 12); do
+            curl -sf http://${{ needs.provision.outputs.server_ip }}/health && break || sleep 15
+          done
+          curl -sf http://${{ needs.provision.outputs.server_ip }}/health \
+            || { echo "ERROR: /health returned non-2xx after all retries — deploy failed"; exit 1; }
+
